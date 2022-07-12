@@ -1,4 +1,3 @@
-from hashlib import new
 import ape
 import pytest
 from ape import chain
@@ -29,9 +28,73 @@ def test_process_report__with_total_assets_equal_current_debt__reverts(
         vault.process_report(strategy.address, sender=gov)
 
 
-def test_process_report__with_unhealthy_strategy__reverts():
-    # TODO: implement when health check is implemented
-    pass
+def test_process_report__with_unhealthy_strategy__reverts(
+    gov, asset, vault, strategy, health_check, add_debt_to_strategy, airdrop_asset
+):
+    vault_balance = asset.balanceOf(vault)
+    new_debt = vault_balance
+    gain = new_debt // 2
+    profit_limit_ratio = 100
+    loss_limit_ratio = 0
+
+    # add debt to strategy
+    add_debt_to_strategy(gov, strategy, vault, new_debt)
+    airdrop_asset(gov, asset, strategy, gain)
+
+    vault.set_health_check(health_check.address, sender=gov)
+    # profit limit ratio set to 1%, gain set to 50% of currentDebt
+    health_check.set_strategy_limits(
+        strategy.address, profit_limit_ratio, loss_limit_ratio, sender=gov
+    )
+
+    with ape.reverts("unhealthy strategy"):
+        vault.process_report(strategy.address, sender=gov)
+
+
+def test_process_report_force__with_unhealthy_strategy_with_gain_and_zero_fees(
+    gov, asset, vault, strategy, health_check, add_debt_to_strategy, airdrop_asset
+):
+    vault_balance = asset.balanceOf(vault)
+    new_debt = vault_balance
+    gain = new_debt // 2
+    profit_limit_ratio = 100
+    loss_limit_ratio = 0
+
+    # add debt to strategy
+    add_debt_to_strategy(gov, strategy, vault, new_debt)
+    airdrop_asset(gov, asset, strategy, gain)
+
+    vault.set_health_check(health_check.address, sender=gov)
+    # profit limit ratio set to 1%, gain set to 50% of currentDebt
+    health_check.set_strategy_limits(
+        strategy.address, profit_limit_ratio, loss_limit_ratio, sender=gov
+    )
+
+    strategy_params = vault.strategies(strategy.address)
+    initial_debt = strategy_params.current_debt
+    locked_profit = vault.locked_profit()
+
+    snapshot = chain.pending_timestamp
+    tx = vault.process_report(strategy.address, True, sender=gov)
+    event = list(tx.decode_logs(vault.StrategyReported))
+
+    assert len(event) == 1
+    assert event[0].strategy == strategy.address
+    assert event[0].gain == gain
+    assert event[0].loss == 0
+    assert event[0].total_gain == gain
+    assert event[0].total_loss == 0
+    assert event[0].current_debt == initial_debt + gain
+    assert event[0].total_fees == 0
+
+    strategy_params = vault.strategies(strategy.address)
+    assert strategy_params.total_gain == gain
+    assert strategy_params.total_loss == 0
+    assert strategy_params.current_debt == initial_debt + gain
+    assert vault.locked_profit() == locked_profit + gain
+    assert vault.strategies(strategy.address).last_report == pytest.approx(
+        snapshot, abs=1
+    )
 
 
 def test_process_report__with_gain_and_zero_fees(
@@ -337,3 +400,13 @@ def test_set_fee_manager__with_fee_manager(gov, vault, fee_manager):
     assert event[0].fee_manager == fee_manager.address
 
     assert vault.fee_manager() == fee_manager.address
+
+
+def test_set_health_check__with_health_check(gov, vault, health_check):
+    tx = vault.set_health_check(health_check.address, sender=gov)
+    event = list(tx.decode_logs(vault.UpdateHealthCheck))
+
+    assert len(event) == 1
+    assert event[0].health_check == health_check.address
+
+    assert vault.health_check() == health_check.address

@@ -4,7 +4,6 @@ from vyper.interfaces import ERC20
 from vyper.interfaces import ERC20Detailed
 
 # TODO: external contract: factory
-# TODO: external contract: healtcheck
 
 # INTERFACES #
 interface IStrategy:
@@ -17,6 +16,9 @@ interface IStrategy:
 
 interface IFeeManager:
     def assess_fees(strategy: address, gain: uint256) -> uint256: view
+
+interface ICommonHealthCheck:
+    def check(strategy: address, gain: uint256, loss: uint256, currentDebt: uint256) -> bool: view
 
 # EVENTS #
 # ERC4626 EVENTS
@@ -73,6 +75,9 @@ event DebtUpdated:
 # STORAGE MANAGEMENT EVENTS
 event UpdateFeeManager:
     fee_manager: address
+
+event UpdateHealthCheck:
+    health_check: address
 
 event UpdatedMaxDebtForStrategy:
     sender: address
@@ -321,7 +326,7 @@ def _max_deposit(receiver: address) -> uint256:
     _deposit_limit: uint256 = self.deposit_limit
     if (_total_assets >= _deposit_limit):
         return 0
-    return _deposit_limit - _total_assets 
+    return _deposit_limit - _total_assets
 
 @view
 @internal
@@ -365,7 +370,7 @@ def _redeem(sender: address, receiver: address, owner: address, shares_to_burn: 
     assert shares > 0, "no shares to withdraw"
 
     assets: uint256 = self._convert_to_assets(shares)
-    
+
     # load to memory to save gas
     curr_total_idle: uint256 = self.total_idle
 
@@ -384,8 +389,8 @@ def _redeem(sender: address, receiver: address, owner: address, shares_to_burn: 
             if assets_to_withdraw == 0:
                 continue
 
-	    # TODO: should the vault check that the strategy has unlocked requested funds? 
-	    # if so, should it just withdraw the unlocked funds and just assume the rest are lost?
+            # TODO: should the vault check that the strategy has unlocked requested funds?
+            # if so, should it just withdraw the unlocked funds and just assume the rest are lost?
             IStrategy(strategy).freeFunds(assets_to_withdraw)
             ASSET.transferFrom(strategy, self, assets_to_withdraw)
             curr_total_idle += assets_to_withdraw
@@ -418,7 +423,7 @@ def _add_strategy(new_strategy: address):
    assert IStrategy(new_strategy).asset() == ASSET.address, "invalid asset"
    assert IStrategy(new_strategy).vault() == self, "invalid vault"
    assert self.strategies[new_strategy].activation == 0, "strategy already active"
-   
+
    self.strategies[new_strategy] = StrategyParams({
       activation: block.timestamp,
       last_report: block.timestamp,
@@ -427,15 +432,15 @@ def _add_strategy(new_strategy: address):
       total_gain: 0,
       total_loss: 0
    })
-   
+
    log StrategyAdded(new_strategy)
-   
+
 @internal
 def _revoke_strategy(old_strategy: address):
    assert self.strategies[old_strategy].activation != 0, "strategy not active"
    # NOTE: strategy needs to have 0 debt to be revoked
    assert self.strategies[old_strategy].current_debt == 0, "strategy has debt"
-   
+
    # NOTE: strategy params are set to 0 (warning: it can be readded)
    self.strategies[old_strategy] = StrategyParams({
       activation: 0,
@@ -445,7 +450,7 @@ def _revoke_strategy(old_strategy: address):
       total_gain: 0,
       total_loss: 0
    })
-   
+
    log StrategyRevoked(old_strategy)
 
 @internal
@@ -508,7 +513,7 @@ def _update_debt(strategy: address) -> uint256:
         total_idle: uint256 = self.total_idle
 
         if total_idle + assets_to_withdraw < minimum_total_idle:
-            assets_to_withdraw = minimum_total_idle - total_idle   
+            assets_to_withdraw = minimum_total_idle - total_idle
             new_debt = current_debt - assets_to_withdraw
 
         withdrawable: uint256 = IStrategy(strategy).withdrawable()
@@ -520,7 +525,7 @@ def _update_debt(strategy: address) -> uint256:
             new_debt = current_debt - withdrawable
 
         IStrategy(strategy).freeFunds(assets_to_withdraw)
-	# TODO: is it worth it to transfer the max_amount between assets_to_withdraw and balance?
+	    # TODO: is it worth it to transfer the max_amount between assets_to_withdraw and balance?
         ASSET.transferFrom(strategy, self, assets_to_withdraw)
         self.total_idle += assets_to_withdraw
         self.total_debt -= assets_to_withdraw
@@ -605,7 +610,7 @@ def _update_report_timestamps():
 
 
 @internal
-def _process_report(strategy: address) -> (uint256, uint256):
+def _process_report(strategy: address, force: bool) -> (uint256, uint256):
     assert self.strategies[strategy].activation != 0, "inactive strategy"
     total_assets: uint256 = IStrategy(strategy).totalAssets()
     current_debt: uint256 = self.strategies[strategy].current_debt
@@ -614,12 +619,15 @@ def _process_report(strategy: address) -> (uint256, uint256):
     gain: uint256 = 0
     loss: uint256 = 0
 
-    # TODO: implement health check
-
     if total_assets > current_debt:
         gain = total_assets - current_debt
     else:
         loss = current_debt - total_assets
+
+    if not force:
+        health_check: address = self.health_check
+        if health_check != ZERO_ADDRESS:
+            assert ICommonHealthCheck(health_check).check(strategy, gain, loss, current_debt), "unhealthy strategy"
 
     if loss > 0:
         self.strategies[strategy].total_loss += loss
@@ -687,6 +695,12 @@ def set_minimum_total_idle(minimum_total_idle: uint256):
     self.minimum_total_idle = minimum_total_idle
     log UpdateMinimumTotalIdle(minimum_total_idle)
 
+@external
+def set_health_check(new_health_check: address):
+    # TODO: permissioning: CONFIG_MANAGER
+    self.health_check = new_health_check
+    log UpdateHealthCheck(new_health_check)
+
 # ROLE MANAGEMENT #
 @internal
 def _enforce_role(account: address, role: Roles):
@@ -723,15 +737,15 @@ def available_deposit_limit() -> uint256:
 
 ## ACCOUNTING MANAGEMENT ##
 @external
-def process_report(strategy: address) -> (uint256, uint256):
+def process_report(strategy: address, force: bool=False) -> (uint256, uint256):
     # TODO: permissioned: ACCOUNTING_MANAGER (open?)
-    return self._process_report(strategy)
+    return self._process_report(strategy, force)
 
 ## STRATEGY MANAGEMENT ##
 @external
-def add_strategy(new_strategy: address): 
+def add_strategy(new_strategy: address):
     self._enforce_role(msg.sender, Roles.STRATEGY_MANAGER)
-    self._add_strategy(new_strategy) 
+    self._add_strategy(new_strategy)
 
 @external
 def revoke_strategy(old_strategy: address):
